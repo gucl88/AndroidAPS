@@ -1,0 +1,109 @@
+# 放到你 GitHub 仓库的 .github/workflows/ 下，文件名随意，比如 build-release.yml
+# 作用：只用 keystore secrets，编 full release 包，产物走 GitHub Actions artifact（免费）
+# 不需要 GDRIVE_OAUTH2，不需要谷歌网盘
+name: Build AAPS Release (No Google Drive)
+
+on:
+  workflow_dispatch:
+    inputs:
+      buildWear:
+        description: '同时编手表端'
+        required: false
+        default: 'true'
+        type: choice
+        options:
+          - 'true'
+          - 'false'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          java-version: '21'
+          distribution: 'temurin'
+          cache: gradle
+
+      - name: Decode keystore
+        env:
+          S_KEYSTORE_SET: ${{ secrets.KEYSTORE_SET }}
+          S_KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+          S_KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          S_KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          S_KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          set -e
+          mkdir -p "$RUNNER_TEMP/keystore"
+          if [ -n "$S_KEYSTORE_SET" ]; then
+            DECODED=$(printf '%s' "$S_KEYSTORE_SET" | base64 -d)
+            B64=$(printf '%s' "$DECODED" | cut -d'|' -f1)
+            SP=$(printf '%s' "$DECODED" | cut -d'|' -f2)
+            AL=$(printf '%s' "$DECODED" | cut -d'|' -f3)
+            KP=$(printf '%s' "$DECODED" | cut -d'|' -f4)
+          else
+            B64="$S_KEYSTORE_BASE64"; SP="$S_KEYSTORE_PASSWORD"; AL="$S_KEY_ALIAS"; KP="$S_KEY_PASSWORD"
+          fi
+          if [ -z "$B64" ]; then
+            echo "❌ 没找到 KEYSTORE_SET 也没找到 KEYSTORE_BASE64，请先在仓库 Settings > Secrets 里配置 keystore"
+            exit 1
+          fi
+          printf '%s' "$B64" | base64 -d > "$RUNNER_TEMP/keystore/keystore.jks"
+          {
+            echo "KS_PASSWORD=$SP"
+            echo "KS_ALIAS=$AL"
+            echo "KS_KEYPASSWORD=$KP"
+          } >> "$GITHUB_ENV"
+          echo "✅ keystore decoded"
+
+      - name: Validate keystore
+        run: |
+          set -e
+          echo test > dummy.txt
+          zip -q dummy.jar dummy.txt
+          rm dummy.txt
+          if ! jarsigner -keystore "$RUNNER_TEMP/keystore/keystore.jks" \
+              -storepass "$KS_PASSWORD" -keypass "$KS_KEYPASSWORD" \
+              dummy.jar "$KS_ALIAS" > /dev/null 2>&1; then
+            echo "❌ keystore/密码/alias 不匹配，检查 secrets 是否与以前编译时一致"
+            exit 1
+          fi
+          rm -f dummy.jar
+          echo "✅ keystore OK"
+
+      - name: Grant execute permission
+        run: chmod +x gradlew
+
+      - name: Build APK
+        run: |
+          set -e
+          TASKS=":app:assembleFullRelease"
+          if [ "${{ github.event.inputs.buildWear }}" = "true" ]; then
+            TASKS="$TASKS :wear:assembleFullRelease"
+          fi
+          ./gradlew $TASKS \
+            -Pandroid.injected.signing.store.file="$RUNNER_TEMP/keystore/keystore.jks" \
+            -Pandroid.injected.signing.store.password="$KS_PASSWORD" \
+            -Pandroid.injected.signing.key.alias="$KS_ALIAS" \
+            -Pandroid.injected.signing.key.password="$KS_KEYPASSWORD" \
+            -Dorg.gradle.jvmargs="-Xmx8g -XX:+UseParallelGC -Xss4m" \
+            -Dkotlin.daemon.jvm.options="-Xmx2g" \
+            -Dkotlin.compiler.execution.strategy="in-process" \
+            -Dorg.gradle.workers.max=8 \
+            -Dorg.gradle.caching=true
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: aaps-release
+          path: |
+            app/build/outputs/apk/full/release/*.apk
+            wear/build/outputs/apk/full/release/*.apk
+          if-no-files-found: warn
