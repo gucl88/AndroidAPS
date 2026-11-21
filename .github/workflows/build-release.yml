@@ -1,6 +1,6 @@
-# 放到你 GitHub 仓库的 .github/workflows/ 下，文件名随意，比如 build-release.yml
-# 作用：只用 keystore secrets，编 full release 包，产物走 GitHub Actions artifact（免费）
-# 不需要 GDRIVE_OAUTH2，不需要谷歌网盘
+# 放到 GitHub 仓库 .github/workflows/build-release.yml
+# 签名方式与 android.yml 完全一致：仓库自带 keystore/demokeystore.jks + STORE_PASSWORD/KEY_ALIAS/KEY_PASSWORD
+# 不需要 KEYSTORE_SET/KEYSTORE_BASE64/GDRIVE_OAUTH2，产物走 GitHub Artifact
 name: Build AAPS Release (No Google Drive)
 
 on:
@@ -9,11 +9,11 @@ on:
       buildWear:
         description: '同时编手表端'
         required: false
-        default: 'true'
+        default: 'false'
         type: choice
         options:
-          - 'true'
           - 'false'
+          - 'true'
 
 jobs:
   build:
@@ -32,83 +32,52 @@ jobs:
           distribution: 'temurin'
           cache: gradle
 
-      - name: Decode keystore
-        env:
-          S_KEYSTORE_SET: ${{ secrets.KEYSTORE_SET }}
-          S_KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
-          S_KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
-          S_KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
-          S_KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
-        run: |
-          set -e
-          DELIM="AAPS_EOF_$(openssl rand -hex 16)"
-          emit() { printf '%s<<%s\n%s\n%s\n' "$1" "$DELIM" "$2" "$DELIM" >> "$GITHUB_ENV"; }
-          emit_masked() { echo "::add-mask::$2"; emit "$1" "$2"; }
-          mkdir -p "$RUNNER_TEMP/keystore"
-          if [ -n "$S_KEYSTORE_SET" ]; then
-            echo "🔐 Decoding KEYSTORE_SET..."
-            DECODED=$(printf '%s' "$S_KEYSTORE_SET" | base64 -d)
-            emit_masked KEYSTORE_BASE64   "$(printf '%s' "$DECODED" | cut -d'|' -f1)"
-            emit_masked KEYSTORE_PASSWORD "$(printf '%s' "$DECODED" | cut -d'|' -f2)"
-            emit_masked KEY_ALIAS         "$(printf '%s' "$DECODED" | cut -d'|' -f3)"
-            emit_masked KEY_PASSWORD      "$(printf '%s' "$DECODED" | cut -d'|' -f4)"
-          else
-            echo "ℹ️ KEYSTORE_SET not provided, using separate secrets."
-            emit KEYSTORE_BASE64   "$S_KEYSTORE_BASE64"
-            emit KEYSTORE_PASSWORD "$S_KEYSTORE_PASSWORD"
-            emit KEY_ALIAS         "$S_KEY_ALIAS"
-            emit KEY_PASSWORD      "$S_KEY_PASSWORD"
-          fi
-
       - name: Validate keystore
         env:
-          KS_B64: ${{ env.KEYSTORE_BASE64 }}
-          KS_STOREPASS: ${{ env.KEYSTORE_PASSWORD }}
-          KS_ALIAS: ${{ env.KEY_ALIAS }}
+          STORE_PASSWORD: ${{ secrets.STORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
         run: |
           set -e
-          if [ -z "$KS_B64" ]; then
-            echo "❌ 没拿到 keystore base64，请检查 KEYSTORE_SET / KEYSTORE_BASE64 secret"
+          # 仓库里提交的 demokeystore.jks 就是历史 APK 的签名来源
+          KS="$GITHUB_WORKSPACE/keystore/demokeystore.jks"
+          ls -la "$KS"
+          if ! keytool -list -keystore "$KS" -storepass "$STORE_PASSWORD" > /tmp/ks_list.txt 2>&1; then
+            echo "❌ demokeystore.jks 与 STORE_PASSWORD 不匹配（keytool -list 失败）"
+            sed -E 's/[A-Za-z0-9+/=]{40,}/[REDACTED]/g' /tmp/ks_list.txt | head -20
             exit 1
           fi
-          printf '%s' "$KS_B64" | base64 -d > "$RUNNER_TEMP/keystore/keystore.jks"
-          ls -la "$RUNNER_TEMP/keystore/keystore.jks"
-          # 1) 验 storepass + 列出 alias
-          if ! keytool -list -keystore "$RUNNER_TEMP/keystore/keystore.jks" -storepass "$KS_STOREPASS" > /tmp/ks_list.txt 2>&1; then
-            echo "❌ keystore 密码错误或文件损坏（keytool -list 失败）"
-            echo "--- keytool 输出（已脱敏） ---"
-            sed -E 's/[A-Za-z0-9+/=]{40,}/[REDACTED]/g' /tmp/ks_list.txt | head -30
+          if ! grep -qi "$KEY_ALIAS" /tmp/ks_list.txt; then
+            echo "❌ alias '$KEY_ALIAS' 在 demokeystore.jks 里不存在！真实 alias："
+            grep -iE "^[A-Za-z0-9_.-]+(,|$)" /tmp/ks_list.txt | head -5
             exit 1
           fi
-          # 2) 验 alias 是否存在（不区分大小写比对）
-          if ! grep -qiE "^$KS_ALIAS(,| |$)" /tmp/ks_list.txt && ! grep -qi "$KS_ALIAS" /tmp/ks_list.txt; then
-            echo "❌ alias '$KS_ALIAS' 在 keystore 里不存在！keystore 里的真实 alias 如下（直接抄进 secrets）："
-            grep -iE "^[A-Za-z0-9_.-]+(,|$)" /tmp/ks_list.txt | head -10
-            exit 1
-          fi
-          echo "✅ keystore + storepass + alias 全部 OK"
+          echo "✅ 仓库 keystore + STORE_PASSWORD + KEY_ALIAS 全部匹配"
 
       - name: Grant execute permission
         run: chmod +x gradlew
 
       - name: Build APK
+        env:
+          STORE_PASSWORD: ${{ secrets.STORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+          STORE_FILE: keystore/demokeystore.jks
         run: |
           set -e
-          # keypass 为空时回退用 storepass（PKCS12 keystore 常见情况）
-          KPASS="${KEY_PASSWORD:-$KEYSTORE_PASSWORD}"
-          echo "keypass empty? $([ -z "${KEY_PASSWORD:-}" ] && echo yes-fallback-to-storepass || echo no)"
+          # 与 android.yml 相同：环境变量供 gradle 的 getStoreFile()/getStorePassword() 回退读取
+          export storePassword="$STORE_PASSWORD"
+          export keyAlias="$KEY_ALIAS"
+          export keyPassword="${KEY_PASSWORD:-$STORE_PASSWORD}"
+          export storeFile="$STORE_FILE"
           TASKS=":app:assembleFullRelease"
           if [ "${{ github.event.inputs.buildWear }}" = "true" ]; then
             TASKS="$TASKS :wear:assembleFullRelease"
           fi
           ./gradlew $TASKS \
-            -Pandroid.injected.signing.store.file="$RUNNER_TEMP/keystore/keystore.jks" \
-            -Pandroid.injected.signing.store.password="$KEYSTORE_PASSWORD" \
-            -Pandroid.injected.signing.key.alias="$KEY_ALIAS" \
-            -Pandroid.injected.signing.key.password="$KPASS" \
-            -Dorg.gradle.jvmargs="-Xmx8g -XX:+UseParallelGC -Xss4m" \
+            -Dorg.gradle.jvmargs="-Xmx8g -XX:+UseParallelGC -Xss1024m" \
             -Dkotlin.daemon.jvm.options="-Xmx2g" \
             -Dkotlin.compiler.execution.strategy="in-process" \
+            -Dorg.gradle.daemon=true \
             -Dorg.gradle.workers.max=8 \
             -Dorg.gradle.caching=true
 
