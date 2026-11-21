@@ -41,42 +41,52 @@ jobs:
           S_KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
         run: |
           set -e
+          DELIM="AAPS_EOF_$(openssl rand -hex 16)"
+          emit() { printf '%s<<%s\n%s\n%s\n' "$1" "$DELIM" "$2" "$DELIM" >> "$GITHUB_ENV"; }
+          emit_masked() { echo "::add-mask::$2"; emit "$1" "$2"; }
           mkdir -p "$RUNNER_TEMP/keystore"
           if [ -n "$S_KEYSTORE_SET" ]; then
+            echo "🔐 Decoding KEYSTORE_SET..."
             DECODED=$(printf '%s' "$S_KEYSTORE_SET" | base64 -d)
-            B64=$(printf '%s' "$DECODED" | cut -d'|' -f1)
-            SP=$(printf '%s' "$DECODED" | cut -d'|' -f2)
-            AL=$(printf '%s' "$DECODED" | cut -d'|' -f3)
-            KP=$(printf '%s' "$DECODED" | cut -d'|' -f4)
+            emit_masked KEYSTORE_BASE64   "$(printf '%s' "$DECODED" | cut -d'|' -f1)"
+            emit_masked KEYSTORE_PASSWORD "$(printf '%s' "$DECODED" | cut -d'|' -f2)"
+            emit_masked KEY_ALIAS         "$(printf '%s' "$DECODED" | cut -d'|' -f3)"
+            emit_masked KEY_PASSWORD      "$(printf '%s' "$DECODED" | cut -d'|' -f4)"
           else
-            B64="$S_KEYSTORE_BASE64"; SP="$S_KEYSTORE_PASSWORD"; AL="$S_KEY_ALIAS"; KP="$S_KEY_PASSWORD"
+            echo "ℹ️ KEYSTORE_SET not provided, using separate secrets."
+            emit KEYSTORE_BASE64   "$S_KEYSTORE_BASE64"
+            emit KEYSTORE_PASSWORD "$S_KEYSTORE_PASSWORD"
+            emit KEY_ALIAS         "$S_KEY_ALIAS"
+            emit KEY_PASSWORD      "$S_KEY_PASSWORD"
           fi
-          if [ -z "$B64" ]; then
-            echo "❌ 没找到 KEYSTORE_SET 也没找到 KEYSTORE_BASE64，请先在仓库 Settings > Secrets 里配置 keystore"
-            exit 1
-          fi
-          printf '%s' "$B64" | base64 -d > "$RUNNER_TEMP/keystore/keystore.jks"
-          {
-            echo "KS_PASSWORD=$SP"
-            echo "KS_ALIAS=$AL"
-            echo "KS_KEYPASSWORD=$KP"
-          } >> "$GITHUB_ENV"
-          echo "✅ keystore decoded"
 
       - name: Validate keystore
+        env:
+          KS_B64: ${{ env.KEYSTORE_BASE64 }}
+          KS_STOREPASS: ${{ env.KEYSTORE_PASSWORD }}
+          KS_ALIAS: ${{ env.KEY_ALIAS }}
         run: |
           set -e
-          echo test > dummy.txt
-          zip -q dummy.jar dummy.txt
-          rm dummy.txt
-          if ! jarsigner -keystore "$RUNNER_TEMP/keystore/keystore.jks" \
-              -storepass "$KS_PASSWORD" -keypass "$KS_KEYPASSWORD" \
-              dummy.jar "$KS_ALIAS" > /dev/null 2>&1; then
-            echo "❌ keystore/密码/alias 不匹配，检查 secrets 是否与以前编译时一致"
+          if [ -z "$KS_B64" ]; then
+            echo "❌ 没拿到 keystore base64，请检查 KEYSTORE_SET / KEYSTORE_BASE64 secret"
             exit 1
           fi
-          rm -f dummy.jar
-          echo "✅ keystore OK"
+          printf '%s' "$KS_B64" | base64 -d > "$RUNNER_TEMP/keystore/keystore.jks"
+          ls -la "$RUNNER_TEMP/keystore/keystore.jks"
+          # 1) 验 storepass + 列出 alias
+          if ! keytool -list -keystore "$RUNNER_TEMP/keystore/keystore.jks" -storepass "$KS_STOREPASS" > /tmp/ks_list.txt 2>&1; then
+            echo "❌ keystore 密码错误或文件损坏（keytool -list 失败）"
+            echo "--- keytool 输出（已脱敏） ---"
+            sed -E 's/[A-Za-z0-9+/=]{40,}/[REDACTED]/g' /tmp/ks_list.txt | head -30
+            exit 1
+          fi
+          # 2) 验 alias 是否存在（不区分大小写比对）
+          if ! grep -qiE "^$KS_ALIAS(,| |$)" /tmp/ks_list.txt && ! grep -qi "$KS_ALIAS" /tmp/ks_list.txt; then
+            echo "❌ alias '$KS_ALIAS' 在 keystore 里不存在！keystore 里的真实 alias 如下（直接抄进 secrets）："
+            grep -iE "^[A-Za-z0-9_.-]+(,|$)" /tmp/ks_list.txt | head -10
+            exit 1
+          fi
+          echo "✅ keystore + storepass + alias 全部 OK"
 
       - name: Grant execute permission
         run: chmod +x gradlew
@@ -84,15 +94,18 @@ jobs:
       - name: Build APK
         run: |
           set -e
+          # keypass 为空时回退用 storepass（PKCS12 keystore 常见情况）
+          KPASS="${KEY_PASSWORD:-$KEYSTORE_PASSWORD}"
+          echo "keypass empty? $([ -z "${KEY_PASSWORD:-}" ] && echo yes-fallback-to-storepass || echo no)"
           TASKS=":app:assembleFullRelease"
           if [ "${{ github.event.inputs.buildWear }}" = "true" ]; then
             TASKS="$TASKS :wear:assembleFullRelease"
           fi
           ./gradlew $TASKS \
             -Pandroid.injected.signing.store.file="$RUNNER_TEMP/keystore/keystore.jks" \
-            -Pandroid.injected.signing.store.password="$KS_PASSWORD" \
-            -Pandroid.injected.signing.key.alias="$KS_ALIAS" \
-            -Pandroid.injected.signing.key.password="$KS_KEYPASSWORD" \
+            -Pandroid.injected.signing.store.password="$KEYSTORE_PASSWORD" \
+            -Pandroid.injected.signing.key.alias="$KEY_ALIAS" \
+            -Pandroid.injected.signing.key.password="$KPASS" \
             -Dorg.gradle.jvmargs="-Xmx8g -XX:+UseParallelGC -Xss4m" \
             -Dkotlin.daemon.jvm.options="-Xmx2g" \
             -Dkotlin.compiler.execution.strategy="in-process" \
