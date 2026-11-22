@@ -1,0 +1,102 @@
+# 放到 GitHub 仓库 .github/workflows/build-release.yml
+# 固定编译 4.0.0（fork 的 master 分支），只保留 Build Variant 下拉
+# 签名用仓库自带 demokeystore.jks + STORE_PASSWORD/KEY_ALIAS/KEY_PASSWORD（不需要 GDRIVE/KEYSTORE_BASE64）
+# 产物走 GitHub Artifact
+name: Build AAPS 4.0 (No Google Drive)
+
+on:
+  workflow_dispatch:
+    inputs:
+      buildVariant:
+        description: 'Select Build Variant'
+        required: true
+        default: 'aapsclientRelease'
+        type: choice
+        options:
+          - fullRelease
+          - fullDebug
+          - aapsclientRelease
+          - aapsclientDebug
+          - aapsclient2Release
+          - aapsclient2Debug
+          - pumpcontrolRelease
+          - pumpcontrolDebug
+
+jobs:
+  build:
+    name: Build AAPS 4.0
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout (master = 4.0.0)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          java-version: '21'
+          distribution: 'temurin'
+          cache: gradle
+
+      - name: Validate keystore
+        env:
+          STORE_PASSWORD: ${{ secrets.STORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+        run: |
+          set -e
+          KS="$GITHUB_WORKSPACE/keystore/demokeystore.jks"
+          ls -la "$KS"
+          if ! keytool -list -keystore "$KS" -storepass "$STORE_PASSWORD" > /tmp/ks_list.txt 2>&1; then
+            echo "❌ demokeystore.jks 与 STORE_PASSWORD 不匹配（keytool -list 失败）"
+            sed -E 's/[A-Za-z0-9+/=]{40,}/[REDACTED]/g' /tmp/ks_list.txt | head -20
+            exit 1
+          fi
+          if ! grep -qi "$KEY_ALIAS" /tmp/ks_list.txt; then
+            echo "❌ alias '$KEY_ALIAS' 在 keystore 里不存在！真实 alias："
+            grep -iE "^[A-Za-z0-9_.-]+(,|$)" /tmp/ks_list.txt | head -5
+            exit 1
+          fi
+          echo "✅ 签名 keystore + STORE_PASSWORD + KEY_ALIAS 全部匹配"
+
+      - name: Determine build task
+        run: |
+          set -e
+          V="${{ github.event.inputs.buildVariant }}"
+          echo "BUILD_VARIANT=$V" >> "$GITHUB_ENV"
+          FLAVOR=$(echo "$V" | sed -E 's/(Release|Debug)$//' | tr '[:upper:]' '[:lower:]')
+          TYPE=$(echo "$V" | grep -oE '(Release|Debug)$' | tr '[:upper:]' '[:lower:]')
+          echo "VARIANT_FLAVOR=$FLAVOR" >> "$GITHUB_ENV"
+          echo "VARIANT_TYPE=$TYPE" >> "$GITHUB_ENV"
+          echo "TASK=:app:assemble${V}" >> "$GITHUB_ENV"
+          echo "ℹ️ 将执行 ./gradlew :app:assemble${V}"
+
+      - name: Grant execute permission
+        run: chmod +x gradlew
+
+      - name: Build APK
+        env:
+          STORE_PASSWORD: ${{ secrets.STORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          set -e
+          export storePassword="$STORE_PASSWORD"
+          export keyAlias="$KEY_ALIAS"
+          export keyPassword="${KEY_PASSWORD:-$STORE_PASSWORD}"
+          export storeFile="keystore/demokeystore.jks"
+          ./gradlew "$TASK" \
+            -Dorg.gradle.jvmargs="-Xmx8g -XX:+UseParallelGC -Xss1024m" \
+            -Dkotlin.daemon.jvm.options="-Xmx2g" \
+            -Dkotlin.compiler.execution.strategy="in-process" \
+            -Dorg.gradle.daemon=true \
+            -Dorg.gradle.workers.max=8 \
+            -Dorg.gradle.caching=true
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: aaps-4.0-${{ github.event.inputs.buildVariant }}
+          path: app/build/outputs/apk/${{ env.VARIANT_FLAVOR }}/${{ env.VARIANT_TYPE }}/*.apk
+          if-no-files-found: error
